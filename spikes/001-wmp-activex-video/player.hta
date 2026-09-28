@@ -1,0 +1,55 @@
+<html>
+<head>
+<title>WMP9 ActiveX Video Test</title>
+<!--
+  Disposable local spike: host the installed WMP ActiveX control in an HTA.
+  The page loads only the operator-selected local media file and makes no
+  network requests or persistent changes to the Wine prefix.
+-->
+<hta:application id="app" applicationname="WMP9 ActiveX Video Test" border="thin" caption="yes" maximizebutton="yes" minimizebutton="yes" scroll="no" singleinstance="yes" sysmenu="yes" />
+<style>
+/* Fill the HTA client area so black borders cannot hide renderer failures. */
+html, body { width:100%; height:100%; margin:0; overflow:hidden; background:#000; }
+#player { width:100%; height:100%; }
+</style>
+</head>
+<body>
+<!-- Use the WMP9-era OCX directly instead of the full wmplayer.exe shell. -->
+<object id="player" classid="CLSID:6BF52A52-394A-11D3-B153-00C04F79FAA6">
+  <param name="uiMode" value="full" />
+  <param name="autoStart" value="true" />
+  <param name="stretchToFit" value="true" />
+  <param name="windowlessVideo" value="false" />
+  <param name="enableContextMenu" value="true" />
+</object>
+<script language="JScript">
+/*
+  WMP9_SPIKE_MEDIA may provide an explicit Windows path.  Otherwise derive the
+  original cache-relative fixture from Wine's HOME variable so the spike does
+  not contain a machine-specific Linux username.
+*/
+window.resizeTo(900, 650);
+try {
+    var shell = new ActiveXObject("WScript.Shell");
+    var environment = shell.Environment("PROCESS");
+    var media = environment("WMP9_SPIKE_MEDIA");
+    if (!media) {
+        var home = environment("HOME");
+        if (!home) {
+            throw new Error("Set WMP9_SPIKE_MEDIA or HOME before running this spike.");
+        }
+        var slash = String.fromCharCode(92);
+        media = "Z:" + home.replace(/\//g, slash)
+            + slash + ".cache" + slash + "wmp9-video-visual-test"
+            + slash + "mjpeg-pcm.avi";
+    }
+    player.URL = media;
+    player.controls.play();
+} catch (e) {
+    // Keep failures visible inside the HTA rather than failing silently.
+    document.body.innerHTML = "<pre style='color:white'>"
+        + (e.description || e.message) + "</pre>";
+}
+</script>
+</body>
+</html>
