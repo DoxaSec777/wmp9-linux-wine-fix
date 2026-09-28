@@ -5,7 +5,7 @@ Experimental compatibility tooling for running Windows Media Player 9 under Wine
 WMP9 remains the visible player and owns the audio, transport controls, timeline, and media state. For video with audio, the launcher gives WMP9 a cached AVI audio proxy, starts a muted borderless `mpv` window over WMP's video area, and follows WMP's play, pause, seek, resize, minimize, and skin state through a read-only remote COM bridge. A private PulseAudio/PipeWire-Pulse null sink holds WMP audio until `mpv` has rendered and aligned its first frame.
 
 > [!WARNING]
-> This project is experimental. Native WMP video under Wine remained black in the tested setup. The overlay, resize, skin, media-handoff, and close lifecycle went through several staging fixes, but production deployment and all Wine, desktop, audio, GPU, and hardware combinations are not guaranteed. In acceptance runs, picture preceded sound by about 0.8 seconds. Test this package alongside your current launcher before replacing anything that already works.
+> This project is experimental and mostly vibe coded by AI. Native WMP video under Wine remained black in the tested setup. The overlay, resize, skin, media-handoff, and close lifecycle went through several staging fixes, but production deployment and all Wine, desktop, audio, GPU, and hardware combinations are not guaranteed. In acceptance runs, picture preceded sound by about 0.8 seconds. Test this package alongside your current launcher before replacing anything that already works.
 
 ## What it does
 
