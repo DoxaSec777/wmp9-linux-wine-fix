@@ -1,0 +1,845 @@
+#!/usr/bin/env python3
+"""Compatibility launcher for Windows Media Player 9 under Wine.
+
+Compressed music is cached as PCM WAV and played in WMP9. Video files use
+mpv through the same desktop launcher because Wine's WMP9 renderer receives
+frames but displays a black surface.
+"""
+
+from __future__ import annotations
+
+import fcntl
+from contextlib import contextmanager
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from urllib.parse import unquote, urlparse
+
+HOME = Path.home()
+PREFIX = Path(os.environ.get("WMP9_PREFIX", HOME / ".wine-wmp9-real"))
+CACHE = Path(os.environ.get("WMP9_CACHE", HOME / ".cache/wmp9-compat"))
+LOG = CACHE / "wmp9-compat.log"
+PLAYER = r"C:\Program Files\Windows Media Player\wmplayer.exe"
+LIBRARY_SYNC = Path(
+    os.environ.get("WMP9_LIBRARY_SYNC", HOME / ".local/bin/wmp9-library-sync")
+)
+CACHE_HIGH = 8 * 1024**3
+CACHE_LOW = 6 * 1024**3
+CACHE_SUFFIXES = {".wav", ".avi"}
+AUDIO_VERSION = "1"
+VIDEO_VERSION = "1"
+
+
+def log(message: str) -> None:
+    """Append one normalized line to the per-user launcher log."""
+    CACHE.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a", encoding="utf-8") as handle:
+        handle.write(message.rstrip() + "\n")
+
+
+def notify(message: str) -> None:
+    """Show a best-effort desktop notification when a GUI session is available."""
+    if not os.environ.get("DISPLAY") or not shutil.which("notify-send"):
+        return
+    try:
+        subprocess.run(
+            ["notify-send", "Windows Media Player 9", message],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
+def normalize_input(raw: str) -> Path:
+    """Resolve a path or file URI to an existing local media file."""
+    if raw.startswith("file://"):
+        parsed = urlparse(raw)
+        raw = unquote(parsed.path)
+    return Path(raw).expanduser().resolve(strict=True)
+
+
+def frame_rate(value: str | None) -> float:
+    """Parse an ffprobe frame-rate value and return a safe positive default."""
+    if not value or value in {"0/0", "N/A"}:
+        return 25.0
+    try:
+        if "/" in value:
+            numerator, denominator = value.split("/", 1)
+            rate = float(numerator) / float(denominator)
+        else:
+            rate = float(value)
+        return rate if rate > 0 else 25.0
+    except (ValueError, ZeroDivisionError):
+        return 25.0
+
+
+def probe(path: Path) -> dict:
+    """Inspect the first usable audio and video streams with ffprobe."""
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_name,codec_type,sample_rate,channels,width,height,avg_frame_rate:stream_disposition=attached_pic:format=duration",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    data = json.loads(result.stdout)
+    streams = data.get("streams") or []
+    # Album artwork is often exposed as a video stream. Treating it as real
+    # video would send ordinary music files to the mpv fallback incorrectly.
+    video_streams = [
+        stream
+        for stream in streams
+        if stream.get("codec_type") == "video"
+        and int((stream.get("disposition") or {}).get("attached_pic") or 0) != 1
+    ]
+    audio_streams = [stream for stream in streams if stream.get("codec_type") == "audio"]
+    if not video_streams and not audio_streams:
+        raise RuntimeError("Keine Audio- oder Videospur gefunden")
+
+    video = video_streams[0] if video_streams else {}
+    audio = audio_streams[0] if audio_streams else {}
+    return {
+        "codec": str(audio.get("codec_name") or ""),
+        "rate": int(audio.get("sample_rate") or 44100),
+        "channels": int(audio.get("channels") or 2),
+        "duration": float((data.get("format") or {}).get("duration") or 0),
+        "has_video": bool(video_streams),
+        "has_audio": bool(audio_streams),
+        "width": int(video.get("width") or 0),
+        "height": int(video.get("height") or 0),
+        "fps": frame_rate(video.get("avg_frame_rate")),
+    }
+
+
+def pcm_parameters(info: dict) -> tuple[int, int]:
+    """Choose PCM settings that keep a compatibility WAV below the RIFF size limit."""
+    rate = min(max(info["rate"], 8000), 48000)
+    channels = 1 if info["channels"] == 1 else 2
+    duration = max(info["duration"], 0)
+    # Classic RIFF/WAV uses 32-bit chunk sizes. Leave headroom for headers and
+    # metadata, then reduce rate/channels only for exceptionally long sources.
+    limit = int(3.5 * 1024**3)
+    while duration and duration * rate * channels * 2 > limit:
+        if rate > 22050:
+            rate = 22050
+        elif channels > 1:
+            channels = 1
+        elif rate > 11025:
+            rate = 11025
+        else:
+            raise RuntimeError("Audiodatei ist für eine WAV-Kompatibilitätskopie zu lang")
+    return rate, channels
+
+
+def video_parameters(info: dict) -> tuple[int, int, float]:
+    """Scale video to an even 720p-sized frame without upscaling or distortion."""
+    width = int(info.get("width") or 0)
+    height = int(info.get("height") or 0)
+    if width < 1 or height < 1:
+        raise RuntimeError("Videogröße konnte nicht ermittelt werden")
+
+    if width >= height:
+        max_width, max_height = 1280, 720
+    else:
+        max_width, max_height = 720, 1280
+    scale = min(1.0, max_width / width, max_height / height)
+    # yuv420p encoders require even dimensions; round down after scaling so
+    # the aspect ratio changes by at most one source pixel.
+    output_width = max(2, int(width * scale) // 2 * 2)
+    output_height = max(2, int(height * scale) // 2 * 2)
+    fps = min(max(float(info.get("fps") or 25.0), 1.0), 30.0)
+    return output_width, output_height, fps
+
+
+def fps_text(fps: float) -> str:
+    """Format a frame rate for an ffmpeg filter without unnecessary zeroes."""
+    return str(int(fps)) if float(fps).is_integer() else f"{fps:.3f}".rstrip("0").rstrip(".")
+
+
+def build_video_command(source: Path, output: Path, info: dict) -> list[str]:
+    """Build the legacy AVI conversion command used by the compatibility cache."""
+    width, height, fps = video_parameters(info)
+    return [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-fflags",
+        "+genpts",
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-map_metadata",
+        "0",
+        "-sn",
+        "-dn",
+        "-vf",
+        f"scale={width}:{height},fps={fps_text(fps)}",
+        "-c:v",
+        "msmpeg4v2",
+        "-q:v",
+        "3",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "192k",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        "-f",
+        "avi",
+        str(output),
+    ]
+
+
+def build_overlay_audio_command(source: Path, output: Path) -> list[str]:
+    """Make a small AVI WMP9 can play; mpv displays the original picture."""
+    return [
+        'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', 'color=c=black:s=32x32:r=1',
+        '-i', str(source), '-map', '0:v:0', '-map', '1:a:0',
+        '-shortest', '-c:v', 'msmpeg4v2', '-q:v', '4',
+        '-c:a', 'libmp3lame', '-b:a', '192k', '-ar', '44100',
+        '-ac', '2', '-f', 'avi', str(output),
+    ]
+
+
+def prefer_overlay(info: dict, available: bool, force_mpv: bool) -> bool:
+    """Return whether integrated WMP audio and mpv video can be used safely."""
+    return (info.get('has_video') is True and info.get('has_audio') is True
+            and available and not force_mpv)
+
+
+def is_direct_wav(path: Path, info: dict) -> bool:
+    """Return whether WMP9 can play this PCM WAV without conversion."""
+    return (
+        path.suffix.lower() in {".wav", ".wave"}
+        and info["codec"].startswith("pcm_")
+        and info["channels"] <= 2
+        and 8000 <= info["rate"] <= 48000
+    )
+
+
+def safe_stem(path: Path) -> str:
+    """Create a short filesystem-safe cache basename from a source filename."""
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "_", path.stem).strip(" ._")
+    return (name or "Titel")[:80]
+
+
+def prune_cache(keep: Path | None = None) -> None:
+    """Trim oldest generated media when the cache exceeds its high-water mark."""
+    media_files = []
+    total = 0
+    for path in CACHE.iterdir() if CACHE.exists() else []:
+        if path.suffix.lower() not in CACHE_SUFFIXES:
+            continue
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        total += stat.st_size
+        media_files.append((stat.st_mtime_ns, stat.st_size, path))
+    if total <= CACHE_HIGH:
+        return
+    # Use separate high and low thresholds to avoid pruning again immediately
+    # after the next small cache entry is created.
+    for _, size, path in sorted(media_files):
+        if total <= CACHE_LOW:
+            break
+        if keep is not None and path == keep:
+            continue
+        try:
+            path.unlink()
+            path.with_suffix(".json").unlink(missing_ok=True)
+            total -= size
+        except OSError:
+            pass
+
+
+def overlay_audio_cache_path(source: Path) -> Path:
+    """Derive a cache path that changes when the source file changes."""
+    stat = source.stat()
+    # Path, size, and nanosecond mtime avoid hashing large media while still
+    # invalidating the proxy after normal file replacements or edits.
+    fingerprint = '\0'.join(('overlay-audio-1', str(source),
+                              str(stat.st_size), str(stat.st_mtime_ns)))
+    digest = hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:16]
+    return CACHE / f'{safe_stem(source)} overlay-audio [{digest}].avi'
+
+
+def prepare_overlay_audio(path: Path, quiet: bool = False) -> Path:
+    """Cache a compact WMP-compatible audio-clock AVI without video re-encoding."""
+    output = overlay_audio_cache_path(path)
+    CACHE.mkdir(parents=True, exist_ok=True)
+    lock_path = output.with_suffix('.lock')
+    with lock_path.open('w') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not output.exists() or output.stat().st_size < 1024:
+            if not quiet:
+                notify(f'Bereite WMP9-Ton für „{path.name}“ vor …')
+            temp = CACHE / ('.' + output.stem + '.part.avi')
+            temp.unlink(missing_ok=True)
+            try:
+                subprocess.run(build_overlay_audio_command(path, temp), check=True)
+                result = probe(temp)
+                if result['codec'] != 'mp3' or not result['has_video'] or result['duration'] <= 0:
+                    raise RuntimeError('WMP9-Audio-Proxy ist nicht abspielbar')
+                os.replace(temp, output)
+            finally:
+                temp.unlink(missing_ok=True)
+        os.utime(output, None)
+    prune_cache(output)
+    return output
+
+
+def prepare_video(path: Path, info: dict, quiet: bool = False) -> Path:
+    """Create or reuse a WMP-compatible legacy AVI conversion."""
+    width, height, fps = video_parameters(info)
+    stat = path.stat()
+    fingerprint = "\0".join(
+        [
+            "video-" + VIDEO_VERSION,
+            str(path),
+            str(stat.st_size),
+            str(stat.st_mtime_ns),
+            str(width),
+            str(height),
+            fps_text(fps),
+        ]
+    )
+    digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:16]
+    CACHE.mkdir(parents=True, exist_ok=True)
+    output = CACHE / f"{safe_stem(path)} [{digest}].avi"
+    metadata = output.with_suffix(".json")
+    lock_path = CACHE / f"{digest}.lock"
+
+    with lock_path.open("w") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not output.exists() or output.stat().st_size < 1024:
+            if not quiet:
+                notify(f"Bereite Video „{path.name}“ für WMP9 vor – dies kann beim ersten Mal dauern …")
+            temp = CACHE / f".{digest}.part.avi"
+            temp.unlink(missing_ok=True)
+            try:
+                subprocess.run(build_video_command(path, temp, info), timeout=None, check=True)
+                if temp.stat().st_size < 1024:
+                    raise RuntimeError("FFmpeg erzeugte keine gültige AVI-Datei")
+                converted = probe(temp)
+                if not converted["has_video"] or converted["duration"] <= 0:
+                    raise RuntimeError("Die erzeugte AVI-Datei enthält kein abspielbares Video")
+                os.replace(temp, output)
+                metadata.write_text(
+                    json.dumps(
+                        {
+                            "source": str(path),
+                            "source_size": stat.st_size,
+                            "source_mtime_ns": stat.st_mtime_ns,
+                            "duration": info["duration"],
+                            "width": width,
+                            "height": height,
+                            "fps": fps,
+                            "video_codec": "msmpeg4v2",
+                            "audio_codec": "mp3",
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            finally:
+                temp.unlink(missing_ok=True)
+        os.utime(output, None)
+
+    prune_cache(output)
+    return output
+
+
+def prepare(path: Path, quiet: bool = False) -> Path:
+    """Create or reuse a WMP-compatible media copy for a source file."""
+    info = probe(path)
+    if info["has_video"]:
+        return prepare_video(path, info, quiet=quiet)
+    if is_direct_wav(path, info):
+        return path
+
+    rate, channels = pcm_parameters(info)
+    stat = path.stat()
+    fingerprint = "\0".join(
+        [
+            AUDIO_VERSION,
+            str(path),
+            str(stat.st_size),
+            str(stat.st_mtime_ns),
+            str(rate),
+            str(channels),
+        ]
+    )
+    digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:16]
+    CACHE.mkdir(parents=True, exist_ok=True)
+    output = CACHE / f"{safe_stem(path)} [{digest}].wav"
+    metadata = output.with_suffix(".json")
+    lock_path = CACHE / f"{digest}.lock"
+
+    with lock_path.open("w") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not output.exists() or output.stat().st_size < 44:
+            if not quiet:
+                notify(f"Bereite „{path.name}“ für WMP9 vor …")
+            temp = CACHE / f".{digest}.part.wav"
+            temp.unlink(missing_ok=True)
+            command = [
+                "ffmpeg",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(path),
+                "-map",
+                "0:a:0",
+                "-map_metadata",
+                "0",
+                "-vn",
+                "-c:a",
+                "pcm_s16le",
+                "-ar",
+                str(rate),
+                "-ac",
+                str(channels),
+                str(temp),
+            ]
+            try:
+                subprocess.run(command, timeout=None, check=True)
+                if temp.stat().st_size < 44:
+                    raise RuntimeError("FFmpeg erzeugte keine gültige WAV-Datei")
+                os.replace(temp, output)
+                metadata.write_text(
+                    json.dumps(
+                        {
+                            "source": str(path),
+                            "source_size": stat.st_size,
+                            "source_mtime_ns": stat.st_mtime_ns,
+                            "codec": info["codec"],
+                            "duration": info["duration"],
+                            "sample_rate": rate,
+                            "channels": channels,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            finally:
+                temp.unlink(missing_ok=True)
+        os.utime(output, None)
+
+    prune_cache(output)
+    return output
+
+
+def windows_path(path: Path) -> str:
+    """Translate an absolute Unix path through Wine drive Z."""
+    return "Z:" + str(path).replace("/", "\\")
+
+
+def should_sync_library(args: list[str]) -> bool:
+    """Return whether a bare launcher invocation should refresh the library."""
+    return len(args) == 0
+
+
+def sync_library() -> None:
+    """Run the separate library synchronizer and record its summary."""
+    if not LIBRARY_SYNC.is_file():
+        raise RuntimeError(f"Bibliothekssynchronisierung fehlt: {LIBRARY_SYNC}")
+    result = subprocess.run(
+        [str(LIBRARY_SYNC)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=True,
+    )
+    if result.stdout.strip():
+        log("LIBRARY " + result.stdout.strip().replace("\n", " | "))
+
+
+def player_command(media: Path | None) -> list[str]:
+    """Build the WMP command for either the library view or one media file."""
+    command = ["wine-stable", PLAYER]
+    if media is None:
+        command += ["/Task", "MediaLibrary"]
+    else:
+        command.append(windows_path(media))
+    return command
+
+
+OVERLAY_DIR = Path.home() / '.local/share/wmp9-compat'
+
+
+def overlay_directory() -> Path:
+    """Return the configured directory containing integrated-overlay helpers."""
+    return Path(os.environ.get('WMP9_OVERLAY_DIR', str(OVERLAY_DIR)))
+
+
+class OverlayCancelled(RuntimeError):
+    """The WMP window was closed before its video companion was ready."""
+
+
+class OverlayBusy(RuntimeError):
+    """An unrelated WMP instance must not be interrupted or played alongside."""
+
+
+def parse_wmp_gui_owner(listing: str) -> int | None:
+    """Extract the Wine WMP process identifier from wmctrl output."""
+    for line in listing.splitlines():
+        fields = line.split(maxsplit=4)
+        if len(fields) >= 4 and 'wmplayer.exe' in fields[3].lower():
+            try:
+                return int(fields[2])
+            except ValueError:
+                continue
+    return None
+
+
+def wmp_gui_owner() -> int | None:
+    """Return the process identifier owning the current WMP X11 window."""
+    result = subprocess.run(['wmctrl', '-lxp'], capture_output=True, text=True, timeout=3)
+    return parse_wmp_gui_owner(result.stdout) if result.returncode == 0 else None
+
+
+def wmp_gui_present() -> bool:
+    """Return whether a WMP X11 window is currently discoverable."""
+    return wmp_gui_owner() is not None
+
+
+def verified_wmp_owner(pid: int, prefix: Path, proc_root: Path = Path('/proc')) -> bool:
+    """Verify that a process belongs to the configured Wine prefix and maps WMP."""
+    if pid <= 0:
+        return False
+    proc = proc_root / str(pid)
+    try:
+        environment = proc.joinpath('environ').read_bytes().split(b'\0')
+        modules = proc.joinpath('maps').read_text(errors='replace').lower()
+        return (b'WINEPREFIX=' + os.fsencode(prefix) in environment
+                and 'wmplayer.exe' in modules)
+    except OSError:
+        return False
+
+
+def overlay_available(directory: Path) -> bool:
+    """Check that the GUI session, helper files, probe, and commands are available."""
+    probe_exe = Path(os.environ.get('WMP_OVERLAY_PROBE', str(OVERLAY_DIR / 'wmp_remote_probe.exe')))
+    return (bool(os.environ.get('DISPLAY')) and (directory / 'top_service.py').is_file()
+            and (directory / 'service.py').is_file() and (directory / 'controller.py').is_file()
+            and probe_exe.is_file()
+            and all(shutil.which(command) for command in ('wine-stable', 'mpv', 'xdotool', 'xwininfo')))
+
+
+def wmp_video_ready(sample: dict, audio: Path) -> bool:
+    """Validate that a remote sample shows the expected proxy in a visible renderer."""
+    return (sample.get('isRemote') is True
+            and str(sample.get('sourceURL', '')).casefold() == windows_path(audio).casefold()
+            and any(w.get('class', '').startswith('WMP Visualization Window')
+                    and w.get('visible') for w in sample.get('windows', [])))
+
+
+def run_wmp_probe(command: list[str], env: dict, gui_present,
+                  require_gui: bool = False, timeout: float = 6):
+    """Read one remote COM sample without blocking WMP-close detection."""
+    process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    seen_gui = require_gui
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            present = gui_present()
+            if seen_gui and not present:
+                raise OverlayCancelled('WMP9 GUI closed during remote probe')
+            seen_gui |= present
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.2, remaining))
+                return subprocess.CompletedProcess(command, process.returncode,
+                                                   stdout, stderr), seen_gui
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+
+
+def wait_for_wmp_video(audio: Path, probe_exe: Path, env: dict,
+                       max_wait: float = 30, poll_interval: float = 0.4,
+                       gui_present=None) -> bool:
+    """Poll remote WMP state until the expected proxy renderer becomes visible."""
+    gui_present = gui_present or wmp_gui_present
+    seen_gui = False
+    deadline = time.monotonic() + max_wait
+    while True:
+        present = gui_present()
+        if seen_gui and not present:
+            raise OverlayCancelled('WMP9 GUI closed before overlay was ready')
+        seen_gui |= present
+        try:
+            result, seen_gui = run_wmp_probe(
+                ['wine-stable', str(probe_exe), '1', '100'], env,
+                gui_present, require_gui=seen_gui)
+            for line in result.stdout.splitlines():
+                if not line.startswith('{'):
+                    continue
+                try:
+                    sample = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if seen_gui and sample.get('type') == 'sample' and wmp_video_ready(sample, audio):
+                    return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if time.monotonic() >= deadline:
+            raise RuntimeError('WMP9-GUI zeigte die erwartete Video-/Tondatei nicht')
+        time.sleep(poll_interval)
+
+
+def overlay_commands(source: Path, audio: Path,
+                     directory: Path = OVERLAY_DIR) -> tuple[list[str], list[str]]:
+    """Build the paired WMP-audio and mpv-overlay process commands."""
+    return ['wine-stable', PLAYER, '/Task', 'NowPlaying', windows_path(audio)], [
+        sys.executable, str(directory / 'top_service.py'), str(source), str(audio)]
+
+
+def video_player_command(media: Path) -> list[str]:
+    """Build the standalone mpv fallback command for original video media."""
+    return [
+        "mpv",
+        "--player-operation-mode=pseudo-gui",
+        "--force-window=yes",
+        "--keep-open=no",
+        "--osc=yes",
+        "--input-default-bindings=yes",
+        "--no-terminal",
+        "--title=Windows Media Player 9 — ${filename}",
+        "--",
+        str(media),
+    ]
+
+
+@contextmanager
+def overlay_session():
+    """Ask an owned launcher to finish cleanup before a new private audio gate.
+
+    Never signal a guessed PID or change an unrelated WMP session. The current
+    launcher receives a cooperative request and closes only its verified GUI.
+    """
+    CACHE.mkdir(parents=True, exist_ok=True)
+    request = CACHE / 'overlay-switch.request'
+    with (CACHE / 'overlay-session.lock').open('a') as lock:
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                request.touch()
+                if time.monotonic() >= deadline:
+                    raise OverlayCancelled('Vorheriger WMP9-Start hat die Übergabe nicht abgeschlossen')
+                time.sleep(0.05)
+        request.unlink(missing_ok=True)
+        try:
+            yield request
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def close_for_handoff(owner: int) -> None:
+    """Close only X11 clients of the WMP process this launcher observed."""
+    if not verified_wmp_owner(owner, PREFIX):
+        raise RuntimeError('WMP9-Owner für Übergabe nicht mehr verifizierbar')
+    result = subprocess.run(['wmctrl', '-lxp'], text=True, capture_output=True,
+                            check=True, timeout=3)
+    for line in result.stdout.splitlines():
+        fields = line.split(maxsplit=4)
+        if len(fields) >= 4 and fields[2] == str(owner) and 'wmplayer.exe' in fields[3].lower():
+            subprocess.run(['wmctrl', '-ic', fields[0]], check=True, timeout=3)
+
+
+def launch_integrated_video(source: Path, directory: Path) -> None:
+    """Serialize integrated video launches and perform cooperative handoff."""
+    with overlay_session():
+        _launch_integrated_video(source, directory)
+
+
+def _launch_integrated_video(source: Path, directory: Path) -> None:
+    """Run one gated WMP-audio and mpv-video overlay session."""
+    audio = prepare_overlay_audio(source)
+    wmp_command, service_command = overlay_commands(source, audio, directory)
+    env = os.environ.copy()
+    env.update(WINEPREFIX=str(PREFIX), WINEDEBUG='-all', WINEDLLOVERRIDES='winedbg.exe=d')
+    # A pre-created private sink prevents even the first Wine audio buffer from
+    # reaching speakers. Do not touch an already-running WMP owner's routing.
+    if wmp_gui_present():
+        raise OverlayBusy('WMP9 ist außerhalb dieses Starters geöffnet; bitte zuerst schließen und Video erneut öffnen')
+    sys.path.insert(0, str(directory))
+    from startup_gate import AudioGate
+    gate = AudioGate()
+    gate.open()
+    env.update(gate.environment())
+    gate_file = CACHE / ('startup-' + gate.name + '.ready')
+    env['WMP9_GATE_FILE'] = str(gate_file)
+    try:
+        with LOG.open('a', encoding='utf-8') as handle:
+            player = subprocess.Popen(wmp_command, env=env, stdin=subprocess.DEVNULL,
+                                      stdout=handle, stderr=subprocess.STDOUT)
+            observed_owner = None
+            handoff_sent = False
+            service = None
+            try:
+                service = subprocess.Popen(service_command, env=env, stdin=subprocess.DEVNULL,
+                                           stdout=handle, stderr=subprocess.STDOUT)
+                while service.poll() is None:
+                    owner = wmp_gui_owner()
+                    if owner is not None:
+                        observed_owner = owner
+                    if owner and not handoff_sent and (CACHE / 'overlay-switch.request').exists():
+                        close_for_handoff(owner)
+                        handoff_sent = True
+                        log('VIDEO_HANDOFF close-owned-gui owner=' + str(owner))
+                    time.sleep(0.1)
+                result = service
+                if observed_owner and not wmp_gui_present():
+                    raise OverlayCancelled('WMP9 GUI closed')
+            finally:
+                if not wmp_gui_present() or service is None or service.returncode:
+                    if (observed_owner and observed_owner != player.pid
+                            and verified_wmp_owner(observed_owner, PREFIX)):
+                        try:
+                            os.kill(observed_owner, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                    if player.poll() is None:
+                        player.terminate()
+                        try:
+                            player.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            player.kill()
+                            player.wait()
+    finally:
+        gate_file.unlink(missing_ok=True)
+        gate.close()
+    if result.returncode:
+        raise RuntimeError(f'WMP9-Video-Overlay beendet mit Status {result.returncode}')
+
+
+def launch_video(media: Path) -> None:
+    """Replace the launcher process with standalone mpv playback."""
+    if not shutil.which("mpv"):
+        raise RuntimeError("mpv ist für die Videowiedergabe nicht installiert")
+    command = video_player_command(media)
+    os.execvp(command[0], command)
+
+
+def launch(media: Path | None) -> None:
+    """Replace the launcher process with WMP in the configured Wine prefix."""
+    env = os.environ.copy()
+    env["WINEPREFIX"] = str(PREFIX)
+    env["WINEDEBUG"] = "-all"
+    current = env.get("WINEDLLOVERRIDES", "")
+    env["WINEDLLOVERRIDES"] = (current + ";" if current else "") + "winedbg.exe=d"
+    command = player_command(media)
+    os.execvpe(command[0], command, env)
+
+
+def main() -> int:
+    """Parse launcher arguments, prepare media, and dispatch the selected player."""
+    quiet = False
+    args = sys.argv[1:]
+    if args and args[0] == "--prepare-only":
+        quiet = True
+        args = args[1:]
+        if len(args) != 1:
+            print("Verwendung: wmp9-compat --prepare-only DATEI", file=sys.stderr)
+            return 2
+    if not args:
+        try:
+            sync_library()
+        except Exception as exc:
+            log(f"LIBRARY_ERROR {exc}")
+            notify(f"Medienbibliothek konnte nicht aktualisiert werden: {exc}")
+        launch(None)
+        return 0
+    try:
+        source = normalize_input(args[0])
+        source_info = probe(source)
+        if source_info["has_video"] and not quiet:
+            directory = overlay_directory()
+            if prefer_overlay(source_info, overlay_available(directory),
+                              os.environ.get('WMP9_FORCE_MPV') == '1'):
+                log(f'VIDEO_OVERLAY source={source}')
+                try:
+                    launch_integrated_video(source, directory)
+                except OverlayCancelled:
+                    log(f'VIDEO_CANCELLED source={source}')
+                    return 0
+                except OverlayBusy as exc:
+                    log(f'VIDEO_BUSY source={source} error={exc}')
+                    notify(str(exc))
+                    return 1
+                except Exception as exc:
+                    log(f'VIDEO_OVERLAY_FAILED source={source} error={exc}')
+                    notify('WMP9-Video konnte nicht eingeblendet werden; starte mpv separat.')
+                    launch_video(source)
+            else:
+                log(f"VIDEO_MPV source={source}")
+                launch_video(source)
+            return 0
+        media = prepare(source, quiet=quiet)
+        log(f"OK source={source} media={media}")
+        if quiet:
+            print(media)
+            return 0
+        launch(media)
+        return 0
+    except Exception as exc:
+        log(f"ERROR input={args[0]!r} error={exc}")
+        notify(f"Datei konnte nicht vorbereitet werden: {exc}")
+        print(f"wmp9-compat: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

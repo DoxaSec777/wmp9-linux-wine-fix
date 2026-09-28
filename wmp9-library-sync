@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""Build and synchronize a compact WMP9-compatible music library."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+from typing import Iterable
+
+HOME = Path.home()
+SOURCE_ROOT = Path(os.environ.get("WMP9_SOURCE_ROOT", HOME / "Musik"))
+LIBRARY_ROOT = Path(
+    os.environ.get("WMP9_LIBRARY_ROOT", HOME / ".local/share/wmp9-compat-library")
+)
+STATE_ROOT = Path(
+    os.environ.get("WMP9_STATE_ROOT", HOME / ".local/state/wmp9-compat")
+)
+PREFIX = Path(os.environ.get("WMP9_PREFIX", HOME / ".wine-wmp9-real"))
+WINE_USER = os.environ.get("WMP9_WINE_USER") or os.environ.get("USER") or HOME.name
+if WINE_USER in {"", ".", ".."} or "/" in WINE_USER or "\\" in WINE_USER:
+    raise RuntimeError("WMP9_WINE_USER must be a single Windows user-directory name")
+WINE_HOME = PREFIX / "drive_c/users" / WINE_USER
+JS_HELPER = Path(
+    os.environ.get(
+        "WMP9_LIBRARY_JS",
+        HOME / ".local/share/wmp9-compat/wmp9-library-apply.js",
+    )
+)
+MUSIC_LINK = WINE_HOME / "Music"
+MEDIA_DB_DIR = WINE_HOME / "AppData/Local/Microsoft/Media Player"
+MANIFEST = STATE_ROOT / "library-manifest.json"
+PLAN = STATE_ROOT / "library-plan.tsv"
+LOG = STATE_ROOT / "library-sync.log"
+BACKUP = STATE_ROOT / "backups/pre-library-sync"
+SUPPORTED_EXTENSIONS = {
+    ".mp3",
+    ".flac",
+    ".m4a",
+    ".aac",
+    ".ogg",
+    ".oga",
+    ".opus",
+    ".wma",
+    ".wav",
+    ".wave",
+}
+FORMAT_VERSION = 1
+
+
+def relative_output(source: Path, source_root: Path) -> Path:
+    """Map a source path to a Windows-safe WAV path within the mirror."""
+    relative = source.relative_to(source_root)
+    safe_parts = []
+    changed = False
+    for part in relative.parts:
+        safe = re.sub(r'[<>:"/\\|?*]', "_", part).rstrip(" .") or "_"
+        changed = changed or safe != part
+        safe_parts.append(safe)
+    output = Path(*safe_parts).with_suffix(".wav")
+    if changed:
+        # Different invalid characters can sanitize to the same name. Append a
+        # stable source-path digest only when sanitization changed the path.
+        digest = hashlib.sha256(str(relative).encode("utf-8")).hexdigest()[:8]
+        output = output.with_name(f"{output.stem} [{digest}].wav")
+    return output
+
+
+def windows_library_path(relative: Path) -> str:
+    """Return the WMP-visible Music path for a mirrored relative file."""
+    return rf"C:\users\{WINE_USER}\Music" + "\\" + str(relative).replace("/", "\\")
+
+
+def wine_windows_path(path: Path) -> str:
+    """Translate an absolute Unix path through Wine drive Z."""
+    return "Z:" + str(path.resolve()).replace("/", "\\")
+
+
+def needs_conversion(source: Path, output: Path, entry: dict | None) -> bool:
+    """Return whether a source changed or its cached output is unusable."""
+    if not entry or not output.exists() or output.stat().st_size < 44:
+        return True
+    stat = source.stat()
+    return (
+        int(entry.get("source_size", -1)) != stat.st_size
+        or int(entry.get("source_mtime_ns", -1)) != stat.st_mtime_ns
+    )
+
+
+def build_audio_command(source: Path, output: Path, info: dict) -> list[str]:
+    """Build an ffmpeg remux or transcode command for MP3-in-WAV output."""
+    command = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(source),
+        "-map",
+        "0:a:0",
+        "-vn",
+    ]
+    if info.get("codec") == "mp3":
+        # WMP9 accepts MP3 frames in a WAV container, so existing MP3 audio can
+        # be remuxed without a generation-loss re-encode.
+        command += ["-c:a", "copy"]
+    else:
+        command += [
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "192k",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+        ]
+    command += ["-f", "wav", str(output)]
+    return command
+
+
+def log(message: str) -> None:
+    """Append one normalized line to the library synchronization log."""
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a", encoding="utf-8") as handle:
+        handle.write(message.rstrip() + "\n")
+
+
+def notify(message: str) -> None:
+    """Show a best-effort progress notification in graphical sessions."""
+    if not os.environ.get("DISPLAY") or not shutil.which("notify-send"):
+        return
+    try:
+        subprocess.run(
+            ["notify-send", "-r", "9919", "Windows Media Player 9", message],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
+def load_manifest() -> dict:
+    """Load a compatible manifest or return an empty current-version manifest."""
+    try:
+        data = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        if int(data.get("version", 0)) == FORMAT_VERSION:
+            return data
+    except (FileNotFoundError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return {"version": FORMAT_VERSION, "items": {}}
+
+
+def atomic_json(path: Path, data: dict) -> None:
+    """Write JSON through a sibling temporary file and atomically replace the target."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name("." + path.name + ".part")
+    temp.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temp, path)
+
+
+def metadata_value(tags: dict, *names: str) -> str:
+    """Return the first non-empty metadata tag with unsafe plan characters removed."""
+    lowered = {str(key).lower(): str(value) for key, value in tags.items()}
+    for name in names:
+        value = lowered.get(name.lower(), "").strip()
+        if value:
+            return value.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    return ""
+
+
+def probe_audio(path: Path) -> dict:
+    """Inspect the first audio stream and normalize metadata for WMP."""
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name,sample_rate,channels:stream_tags:format=duration:format_tags",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    data = json.loads(result.stdout)
+    audio = next(
+        (stream for stream in data.get("streams", []) if stream.get("codec_type") == "audio"),
+        None,
+    )
+    if audio is None:
+        raise RuntimeError("Keine Audiospur gefunden")
+    tags = {}
+    tags.update((data.get("format") or {}).get("tags") or {})
+    tags.update(audio.get("tags") or {})
+    duration = float((data.get("format") or {}).get("duration") or 0)
+    return {
+        "codec": str(audio.get("codec_name") or ""),
+        "rate": int(audio.get("sample_rate") or 44100),
+        "channels": int(audio.get("channels") or 2),
+        "duration": duration,
+        "title": metadata_value(tags, "title") or path.stem,
+        "author": metadata_value(tags, "artist", "album_artist", "albumartist"),
+        "album": metadata_value(tags, "album"),
+        "genre": metadata_value(tags, "genre"),
+        "track": metadata_value(tags, "track", "tracknumber").split("/", 1)[0],
+        "year": metadata_value(tags, "date", "year")[:4],
+    }
+
+
+def scan_sources() -> list[Path]:
+    """Return supported source files in stable case-insensitive order."""
+    if not SOURCE_ROOT.is_dir():
+        raise RuntimeError(f"Musikordner fehlt: {SOURCE_ROOT}")
+    return sorted(
+        (
+            path
+            for path in SOURCE_ROOT.rglob("*")
+            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        ),
+        key=lambda path: str(path).casefold(),
+    )
+
+
+def valid_cached_entry(source: Path, output: Path, previous: dict | None) -> dict | None:
+    """Return a reusable manifest entry when its source and output still match."""
+    if needs_conversion(source, output, previous):
+        return None
+    return dict(previous or {})
+
+
+def convert_one(source: Path, output: Path, info: dict) -> None:
+    """Create and validate one MP3-in-WAV compatibility file atomically."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temp = output.with_name("." + output.stem + ".part.wav")
+    temp.unlink(missing_ok=True)
+    try:
+        subprocess.run(build_audio_command(source, temp, info), check=True, timeout=None)
+        converted = probe_audio(temp)
+        if converted["codec"] != "mp3" or converted["duration"] <= 0 or temp.stat().st_size < 44:
+            raise RuntimeError("Die Kompatibilitätsdatei ist ungültig")
+        os.replace(temp, output)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def make_entry(source: Path, output_relative: Path, info: dict) -> dict:
+    """Build a manifest record for one mirrored library item."""
+    stat = source.stat()
+    return {
+        "source": str(source),
+        "source_size": stat.st_size,
+        "source_mtime_ns": stat.st_mtime_ns,
+        "format_version": FORMAT_VERSION,
+        "output_relative": str(output_relative),
+        "windows_path": windows_library_path(output_relative),
+        "codec": info.get("codec", ""),
+        "duration": float(info.get("duration", 0)),
+        "title": str(info.get("title") or source.stem),
+        "author": str(info.get("author") or ""),
+        "album": str(info.get("album") or ""),
+        "genre": str(info.get("genre") or ""),
+        "track": str(info.get("track") or ""),
+        "year": str(info.get("year") or ""),
+    }
+
+
+def remove_stale(previous_items: dict, current_items: dict) -> int:
+    """Delete mirror files no longer represented by current sources."""
+    removed = 0
+    current_outputs = {
+        str(item.get("output_relative", "")) for item in current_items.values()
+    }
+    for entry in previous_items.values():
+        relative = str(entry.get("output_relative", ""))
+        if not relative or relative in current_outputs:
+            continue
+        output = LIBRARY_ROOT / relative
+        try:
+            output.unlink(missing_ok=True)
+            removed += 1
+        except OSError as exc:
+            log(f"WARN stale={output} error={exc}")
+    for directory in sorted(
+        (path for path in LIBRARY_ROOT.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    return removed
+
+
+def write_plan(items: Iterable[dict]) -> None:
+    """Write the UTF-16 tab-separated import plan consumed by cscript."""
+    PLAN.parent.mkdir(parents=True, exist_ok=True)
+    temp = PLAN.with_name("." + PLAN.name + ".part")
+    fields = [
+        "windows_path",
+        "title",
+        "author",
+        "album",
+        "genre",
+        "track",
+        "year",
+    ]
+    with temp.open("w", encoding="utf-16", newline="") as handle:
+        handle.write("\t".join(fields) + "\n")
+        for item in sorted(items, key=lambda row: row["windows_path"].casefold()):
+            values = []
+            for field in fields:
+                value = str(item.get(field, ""))
+                values.append(value.replace("\t", " ").replace("\r", " ").replace("\n", " "))
+            handle.write("\t".join(values) + "\n")
+    os.replace(temp, PLAN)
+
+
+def backup_state() -> None:
+    """Preserve WMP databases and the original Wine Music link once."""
+    BACKUP.mkdir(parents=True, exist_ok=True)
+    # Never overwrite the first known-good database/link backup on later syncs.
+    for name in ("CurrentDatabase_59R.wmdb", "wmpfolders.wmdb"):
+        source = MEDIA_DB_DIR / name
+        target = BACKUP / name
+        if source.exists() and not target.exists():
+            shutil.copy2(source, target)
+    target_file = BACKUP / "wine-music-link-target.txt"
+    if MUSIC_LINK.is_symlink() and not target_file.exists():
+        target_file.write_text(str(MUSIC_LINK.readlink()) + "\n", encoding="utf-8")
+
+
+def redirect_wine_music() -> None:
+    """Redirect only the Wine prefix Music link to the compatibility mirror."""
+    LIBRARY_ROOT.mkdir(parents=True, exist_ok=True)
+    if not MUSIC_LINK.is_symlink():
+        raise RuntimeError(f"Unerwarteter Wine-Musikpfad: {MUSIC_LINK}")
+    current = MUSIC_LINK.resolve()
+    if current == LIBRARY_ROOT.resolve():
+        return
+    if current != SOURCE_ROOT.resolve():
+        raise RuntimeError(f"Wine-Musikpfad zeigt unerwartet auf {current}")
+    # The real source tree remains untouched; only Wine's shell-folder symlink
+    # is redirected to the generated mirror.
+    MUSIC_LINK.unlink()
+    MUSIC_LINK.symlink_to(LIBRARY_ROOT, target_is_directory=True)
+
+
+def apply_plan() -> str:
+    """Invoke the Windows Script Host helper inside the configured Wine prefix."""
+    if not JS_HELPER.is_file():
+        raise RuntimeError(f"WMP-Bibliothekshelfer fehlt: {JS_HELPER}")
+    env = os.environ.copy()
+    env["WINEPREFIX"] = str(PREFIX)
+    env["WINEDEBUG"] = "-all"
+    current = env.get("WINEDLLOVERRIDES", "")
+    env["WINEDLLOVERRIDES"] = (current + ";" if current else "") + "winedbg.exe=d"
+    result = subprocess.run(
+        [
+            "wine-stable",
+            "cscript.exe",
+            "//nologo",
+            wine_windows_path(JS_HELPER),
+            wine_windows_path(PLAN),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=True,
+        env=env,
+    )
+    return result.stdout.strip()
+
+
+def synchronize(prepare_only: bool = False) -> tuple[int, int, int, list[str]]:
+    """Refresh converted media, state, Wine redirection, and WMP metadata."""
+    old_manifest = load_manifest()
+    previous_items = old_manifest.get("items", {})
+    sources = scan_sources()
+    LIBRARY_ROOT.mkdir(parents=True, exist_ok=True)
+    current_items: dict[str, dict] = {}
+    converted_count = 0
+    failures: list[str] = []
+
+    notify(f"Musikbibliothek wird vorbereitet: {len(sources)} Titel …")
+    for index, source in enumerate(sources, 1):
+        relative = relative_output(source, SOURCE_ROOT)
+        output = LIBRARY_ROOT / relative
+        previous = previous_items.get(str(source))
+        try:
+            entry = valid_cached_entry(source, output, previous)
+            if entry is None:
+                info = probe_audio(source)
+                convert_one(source, output, info)
+                entry = make_entry(source, relative, info)
+                converted_count += 1
+            current_items[str(source)] = entry
+            if index == 1 or index % 20 == 0 or index == len(sources):
+                notify(f"Musikbibliothek: {index}/{len(sources)} Titel")
+        except Exception as exc:
+            message = f"{source}: {exc}"
+            failures.append(message)
+            log("ERROR " + message)
+            if previous and output.exists():
+                current_items[str(source)] = previous
+
+    removed_count = remove_stale(previous_items, current_items)
+    manifest = {"version": FORMAT_VERSION, "items": current_items}
+    atomic_json(MANIFEST, manifest)
+    write_plan(current_items.values())
+
+    apply_output = "prepare-only"
+    if not prepare_only:
+        backup_state()
+        redirect_wine_music()
+        apply_output = apply_plan()
+    log(
+        f"OK sources={len(sources)} converted={converted_count} removed={removed_count} "
+        f"failures={len(failures)} apply={apply_output}"
+    )
+    notify(
+        f"Musikbibliothek bereit: {len(current_items)} Titel"
+        + (f", {len(failures)} Fehler" if failures else "")
+    )
+    return len(current_items), converted_count, removed_count, failures
+
+
+def main() -> int:
+    """Parse synchronization options, run the job, and report a compact summary."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--prepare-only", action="store_true")
+    args = parser.parse_args()
+    try:
+        total, converted, removed, failures = synchronize(prepare_only=args.prepare_only)
+        print(
+            f"TOTAL={total} CONVERTED={converted} REMOVED={removed} FAILURES={len(failures)}"
+        )
+        for failure in failures:
+            print("FAIL " + failure, file=sys.stderr)
+        return 1 if failures else 0
+    except Exception as exc:
+        log(f"FATAL {exc}")
+        notify(f"Musikbibliothek konnte nicht synchronisiert werden: {exc}")
+        print(f"wmp9-library-sync: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

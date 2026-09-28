@@ -1,0 +1,10 @@
+# Portable desktop template; install_overlay.py writes an absolute Exec path.
+[Desktop Entry]
+Name=Windows Media Player 9
+Comment=Windows Media Player 9 via Wine
+Exec=wmp9-compat %f
+Type=Application
+StartupNotify=false
+Terminal=false
+Categories=AudioVideo;Player;
+MimeType=audio/mpeg;audio/mp3;audio/x-mp3;audio/wav;audio/x-wav;audio/x-ms-wma;audio/flac;audio/x-flac;audio/ogg;audio/x-vorbis+ogg;audio/mp4;audio/x-m4a;audio/aac;video/mp4;video/x-m4v;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;video/mpeg;video/mp2t;video/x-flv;video/3gpp;video/ogg;video/x-ms-wmv;video/x-ms-asf;video/x-ms-wvx;application/vnd.rn-realmedia;video/vnd.rn-realvideo;
